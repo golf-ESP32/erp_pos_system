@@ -1,0 +1,2924 @@
+คุณคือ Senior Full-Stack Software Architect และ Principal Flutter & Backend Developer 
+ฉันต้องการให้คุณช่วยเขียนโค้ดและสร้างโปรเจกต์สำหรับระบบบริหารจัดการสินค้า วัตถุดิบ และการขาย (ERP / POS System) 
+ระบบจะต้องรองรับการทำงาน Multi-Platform (PC, Tablet, Mobile), ทำงาน Offline-First ได้ และมีโครงสร้างข้อมูลที่ซับซ้อน
+
+=====================================================
+1. TECH STACK & ARCHITECTURE REQUIREMENTS
+=====================================================
+- Client App: Flutter (Dart) - Single codebase สำหรับ Windows, iPadOS, Android Tablet และ Mobile
+- Local Database (Offline-First): SQLite บน Flutter โดยใช้ Package `drift`
+- Server Database: PostgreSQL
+- Backend Framework: Node.js + Express (JavaScript) [เขียน RESTful API Specs และ SQL Queries]
+- Architecture Pattern: Clean Architecture + Repository Pattern + State Management (Bloc / Riverpod / Provider)
+
+=====================================================
+2. CORE BUSINESS LOGIC & BARCODE SPECIFICATIONS
+=====================================================
+[1. Dynamic 5-Digit Auto ItemCode Logic]
+- ItemCode มีความยาว 5 หลักสม่ำเสมอ ล็อกตาม Dynamic Running Length 
+- คำนวณจาก PrefixCode ในตาราง `pbitemgroup_prefix` (ความยาว 2 หรือ 3 หลัก) + เลขรันลำดับ (SeqNo)
+- หาก SeqNo เต็ม MaxSeqNo (999 สำหรับ 2 หลัก, 99 สำหรับ 3 หลัก) ให้ตัด IsActive = 0 และเปิดใช้ PrefixCode ชุดใหม่
+
+[2. Multi-Unit & Unit Conversion Override]
+- มี Master Group (`pbunitgroup`) และ Master Conversion (`pbunit_conversion`)
+- ในระดับ Item (`pbitem_unit`) สามารถเลือกหน่วยนับจาก Group มาใช้งาน และ **สามารถ Override อัตราแปลง (ConversionFactor) แยกตาม ItemCode ได้**
+
+[3. Multi-Barcode & Multi-Price]
+- 1 ItemCode มีได้หลายบาร์โค้ด และแต่ละบาร์โค้ดผูกกับ UnitCode ที่ต่างกันได้ (`pbitem_barcode`)
+- มีระดับราคาขาย 4 ระดับ (PriceLevel1 - PriceLevel4) ประจำแต่ละบาร์โค้ด
+
+[4. GS1 EAN-13 Internal Barcode Pattern (13 Digits)]
+- รูปแบบบาร์โค้ดสากล 13 หลักพอดี:
+  `2191` (Prefix 4 หลัก) + `ItemCode` (5 หลัก) + `Sequence` (3 หลัก: 000-999) + `CheckDigit` (1 หลัก Modulo 10)
+  (รวม: 4 + 5 + 3 + 1 = 13 หลัก)
+
+[5. Item Roles (Multi-Role Flags)]
+- 1 ItemCode เป็นได้หลายบทบาท คุมด้วย Flags: `IsRawMaterial`, `IsFinishedGood`, `IsSalesItem`, `IsPurchaseItem`
+
+=====================================================
+3. SERVER DATABASE SCHEMA (PostgreSQL Schema)
+=====================================================
+ทุกตารางประกอบด้วย CreatedAt, UpdatedAt และ Comment อธิบายภาษาไทย:
+มาตรฐานโครงสร้างตาราง:
+ชื่อตารางและคอลัมน์ใช้ตัวพิมพ์เล็กทั้งหมด
+ใช้ snake_case และ _ คั่นคำ
+ชื่อตารางทุกตารางขึ้นต้นด้วย pb_
+ชื่อตารางใช้พหูพจน์ เช่น pb_items
+Primary key ใช้ id
+Foreign key ใช้ <entity>_id
+รหัสธุรกิจใช้ <entity>_code
+ชื่อข้อมูลหลักใช้ <entity>_name
+หลีกเลี่ยงชื่อกำกวม เช่น code, name, group_code เมื่อไม่ทราบบริบท
+ไม่ต้องใส่ชื่อตารางนำหน้าคอลัมน์มาตรฐาน เช่น created_at
+Boolean ใช้ is_, has_ หรือ can_
+วันที่พร้อมเวลาใช้ _at; วันที่อย่างเดียวใช้ _date
+ใช้คำย่อเฉพาะคำมาตรฐาน เช่น id, qty, no, uom
+หลีกเลี่ยงคำย่อที่อ่านยาก เช่น itm_grp_cd
+ชื่อ Unique index ใช้ uq_<table>_<columns>
+ชื่อ Index ใช้ idx_<table>_<columns>
+ชื่อ Foreign key constraint ใช้ fk_<table>_<referenced_table>
+
+ความสัมพันธ์หลัก
+pb_item_groups
+    └── pb_items
+
+pb_unit_groups
+    ├── pb_units
+    └── pb_items
+
+pb_items
+    ├── pb_item_units
+    ├── pb_stock_balances
+    ├── pb_stock_transaction_lines
+    └── pb_item_suppliers
+
+pb_warehouses
+    ├── pb_stock_balances
+    └── pb_stock_transaction_lines
+
+pb_stock_transactions
+    └── pb_stock_transaction_lines
+
+pb_suppliers
+    └── pb_item_suppliers
+
+SQL สร้างตาราง
+CREATE DATABASE IF NOT EXISTS pb_erp
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_unicode_ci;
+
+USE pb_erp;
+
+-- =========================================================
+-- 1. กลุ่มสินค้า
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS pb_item_groups (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    item_group_code VARCHAR(30) NOT NULL,
+    item_group_name VARCHAR(150) NOT NULL,
+    description VARCHAR(500) NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+
+    CONSTRAINT pk_pb_item_groups
+        PRIMARY KEY (id),
+
+    CONSTRAINT uq_pb_item_groups_code
+        UNIQUE (item_group_code)
+) ENGINE=InnoDB;
+
+
+-- =========================================================
+-- 2. กลุ่มหน่วยนับ
+-- สร้างก่อนโดยยังไม่กำหนด FK ของ base_unit_id
+-- เพราะ pb_units ยังไม่ถูกสร้าง
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS pb_unit_groups (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    unit_group_code VARCHAR(30) NOT NULL,
+    unit_group_name VARCHAR(150) NOT NULL,
+    base_unit_id BIGINT UNSIGNED NULL,
+    description VARCHAR(500) NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+
+    CONSTRAINT pk_pb_unit_groups
+        PRIMARY KEY (id),
+
+    CONSTRAINT uq_pb_unit_groups_code
+        UNIQUE (unit_group_code)
+) ENGINE=InnoDB;
+
+
+-- =========================================================
+-- 3. หน่วยนับ
+-- base_qty หมายถึงจำนวนเมื่อแปลงเป็นหน่วยฐาน
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS pb_units (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    unit_group_id BIGINT UNSIGNED NOT NULL,
+    unit_code VARCHAR(30) NOT NULL,
+    unit_name VARCHAR(100) NOT NULL,
+    unit_symbol VARCHAR(20) NULL,
+    base_qty DECIMAL(18,6) NOT NULL DEFAULT 1.000000,
+    decimal_places TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+
+    CONSTRAINT pk_pb_units
+        PRIMARY KEY (id),
+
+    CONSTRAINT uq_pb_units_group_code
+        UNIQUE (unit_group_id, unit_code),
+
+    CONSTRAINT fk_pb_units_unit_group
+        FOREIGN KEY (unit_group_id)
+        REFERENCES pb_unit_groups (id)
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+
+    CONSTRAINT chk_pb_units_base_qty
+        CHECK (base_qty > 0),
+
+    CONSTRAINT chk_pb_units_decimal_places
+        CHECK (decimal_places <= 6)
+) ENGINE=InnoDB;
+
+CREATE INDEX idx_pb_units_unit_group_id
+    ON pb_units (unit_group_id);
+
+
+-- เพิ่ม Foreign key หน่วยฐานหลังจากสร้าง pb_units แล้ว
+ALTER TABLE pb_unit_groups
+    ADD CONSTRAINT fk_pb_unit_groups_base_unit
+    FOREIGN KEY (base_unit_id)
+    REFERENCES pb_units (id)
+    ON UPDATE RESTRICT
+    ON DELETE RESTRICT;
+
+
+-- =========================================================
+-- 4. สินค้าและวัสดุ
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS pb_items (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    item_code VARCHAR(50) NOT NULL,
+    item_name VARCHAR(255) NOT NULL,
+    item_group_id BIGINT UNSIGNED NULL,
+    unit_group_id BIGINT UNSIGNED NOT NULL,
+    base_unit_id BIGINT UNSIGNED NOT NULL,
+    barcode VARCHAR(100) NULL,
+    description TEXT NULL,
+    cost_price DECIMAL(18,4) NOT NULL DEFAULT 0.0000,
+    selling_price DECIMAL(18,4) NOT NULL DEFAULT 0.0000,
+    min_stock_qty DECIMAL(18,6) NOT NULL DEFAULT 0.000000,
+    max_stock_qty DECIMAL(18,6) NULL,
+    is_stock_item BOOLEAN NOT NULL DEFAULT TRUE,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+
+    CONSTRAINT pk_pb_items
+        PRIMARY KEY (id),
+
+    CONSTRAINT uq_pb_items_item_code
+        UNIQUE (item_code),
+
+    CONSTRAINT uq_pb_items_barcode
+        UNIQUE (barcode),
+
+    CONSTRAINT fk_pb_items_item_group
+        FOREIGN KEY (item_group_id)
+        REFERENCES pb_item_groups (id)
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_pb_items_unit_group
+        FOREIGN KEY (unit_group_id)
+        REFERENCES pb_unit_groups (id)
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_pb_items_base_unit
+        FOREIGN KEY (base_unit_id)
+        REFERENCES pb_units (id)
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+
+    CONSTRAINT chk_pb_items_cost_price
+        CHECK (cost_price >= 0),
+
+    CONSTRAINT chk_pb_items_selling_price
+        CHECK (selling_price >= 0),
+
+    CONSTRAINT chk_pb_items_min_stock
+        CHECK (min_stock_qty >= 0),
+
+    CONSTRAINT chk_pb_items_max_stock
+        CHECK (
+            max_stock_qty IS NULL
+            OR max_stock_qty >= min_stock_qty
+        )
+) ENGINE=InnoDB;
+
+CREATE INDEX idx_pb_items_item_name
+    ON pb_items (item_name);
+
+CREATE INDEX idx_pb_items_item_group_id
+    ON pb_items (item_group_id);
+
+CREATE INDEX idx_pb_items_unit_group_id
+    ON pb_items (unit_group_id);
+
+CREATE INDEX idx_pb_items_base_unit_id
+    ON pb_items (base_unit_id);
+
+
+-- =========================================================
+-- 5. หน่วยที่อนุญาตให้ใช้กับสินค้า
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS pb_item_units (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    item_id BIGINT UNSIGNED NOT NULL,
+    unit_id BIGINT UNSIGNED NOT NULL,
+    barcode VARCHAR(100) NULL,
+    purchase_price DECIMAL(18,4) NOT NULL DEFAULT 0.0000,
+    selling_price DECIMAL(18,4) NOT NULL DEFAULT 0.0000,
+    is_purchase_unit BOOLEAN NOT NULL DEFAULT FALSE,
+    is_sale_unit BOOLEAN NOT NULL DEFAULT FALSE,
+    is_default BOOLEAN NOT NULL DEFAULT FALSE,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+
+    CONSTRAINT pk_pb_item_units
+        PRIMARY KEY (id),
+
+    CONSTRAINT uq_pb_item_units_item_unit
+        UNIQUE (item_id, unit_id),
+
+    CONSTRAINT uq_pb_item_units_barcode
+        UNIQUE (barcode),
+
+    CONSTRAINT fk_pb_item_units_item
+        FOREIGN KEY (item_id)
+        REFERENCES pb_items (id)
+        ON UPDATE RESTRICT
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_pb_item_units_unit
+        FOREIGN KEY (unit_id)
+        REFERENCES pb_units (id)
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+
+    CONSTRAINT chk_pb_item_units_purchase_price
+        CHECK (purchase_price >= 0),
+
+    CONSTRAINT chk_pb_item_units_selling_price
+        CHECK (selling_price >= 0)
+) ENGINE=InnoDB;
+
+CREATE INDEX idx_pb_item_units_item_id
+    ON pb_item_units (item_id);
+
+CREATE INDEX idx_pb_item_units_unit_id
+    ON pb_item_units (unit_id);
+
+
+-- =========================================================
+-- 6. คลังสินค้า
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS pb_warehouses (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    warehouse_code VARCHAR(30) NOT NULL,
+    warehouse_name VARCHAR(150) NOT NULL,
+    description VARCHAR(500) NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+
+    CONSTRAINT pk_pb_warehouses
+        PRIMARY KEY (id),
+
+    CONSTRAINT uq_pb_warehouses_code
+        UNIQUE (warehouse_code)
+) ENGINE=InnoDB;
+
+
+-- =========================================================
+-- 7. ยอดคงเหลือปัจจุบัน
+-- จำนวนทั้งหมดเก็บเป็นหน่วยฐานของสินค้า
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS pb_stock_balances (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    warehouse_id BIGINT UNSIGNED NOT NULL,
+    item_id BIGINT UNSIGNED NOT NULL,
+    stock_qty DECIMAL(18,6) NOT NULL DEFAULT 0.000000,
+    reserved_qty DECIMAL(18,6) NOT NULL DEFAULT 0.000000,
+    available_qty DECIMAL(18,6)
+        GENERATED ALWAYS AS (stock_qty - reserved_qty) STORED,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+
+    CONSTRAINT pk_pb_stock_balances
+        PRIMARY KEY (id),
+
+    CONSTRAINT uq_pb_stock_balances_wh_item
+        UNIQUE (warehouse_id, item_id),
+
+    CONSTRAINT fk_pb_stock_balances_warehouse
+        FOREIGN KEY (warehouse_id)
+        REFERENCES pb_warehouses (id)
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_pb_stock_balances_item
+        FOREIGN KEY (item_id)
+        REFERENCES pb_items (id)
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+
+    CONSTRAINT chk_pb_stock_balances_reserved
+        CHECK (reserved_qty >= 0)
+) ENGINE=InnoDB;
+
+CREATE INDEX idx_pb_stock_balances_item_id
+    ON pb_stock_balances (item_id);
+
+
+-- =========================================================
+-- 8. หัวเอกสารเคลื่อนไหวสต็อก
+--
+-- transaction_type ตัวอย่าง:
+-- OPENING, RECEIPT, ISSUE, TRANSFER, ADJUSTMENT,
+-- PURCHASE_RECEIPT, SALE_ISSUE, RETURN_IN, RETURN_OUT
+--
+-- transaction_status:
+-- DRAFT, POSTED, CANCELLED
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS pb_stock_transactions (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    transaction_no VARCHAR(50) NOT NULL,
+    transaction_type VARCHAR(30) NOT NULL,
+    transaction_status VARCHAR(20) NOT NULL DEFAULT 'DRAFT',
+    transaction_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    ref_no VARCHAR(100) NULL,
+    description VARCHAR(500) NULL,
+    posted_at DATETIME NULL,
+    cancelled_at DATETIME NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+
+    CONSTRAINT pk_pb_stock_transactions
+        PRIMARY KEY (id),
+
+    CONSTRAINT uq_pb_stock_transactions_no
+        UNIQUE (transaction_no),
+
+    CONSTRAINT chk_pb_stock_transactions_status
+        CHECK (
+            transaction_status IN (
+                'DRAFT',
+                'POSTED',
+                'CANCELLED'
+            )
+        )
+) ENGINE=InnoDB;
+
+CREATE INDEX idx_pb_stock_transactions_date
+    ON pb_stock_transactions (transaction_date);
+
+CREATE INDEX idx_pb_stock_transactions_type_status
+    ON pb_stock_transactions (
+        transaction_type,
+        transaction_status
+    );
+
+
+-- =========================================================
+-- 9. รายการเคลื่อนไหวสต็อก
+--
+-- movement_qty:
+-- ค่าบวก = รับเข้า
+-- ค่าลบ = จ่ายออก
+--
+-- base_movement_qty = movement_qty * conversion_rate
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS pb_stock_transaction_lines (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    stock_transaction_id BIGINT UNSIGNED NOT NULL,
+    line_no INT UNSIGNED NOT NULL,
+    warehouse_id BIGINT UNSIGNED NOT NULL,
+    item_id BIGINT UNSIGNED NOT NULL,
+    unit_id BIGINT UNSIGNED NOT NULL,
+    movement_qty DECIMAL(18,6) NOT NULL,
+    conversion_rate DECIMAL(18,6) NOT NULL DEFAULT 1.000000,
+    base_movement_qty DECIMAL(18,6) NOT NULL,
+    unit_cost DECIMAL(18,4) NOT NULL DEFAULT 0.0000,
+    line_amount DECIMAL(18,4) NOT NULL DEFAULT 0.0000,
+    lot_no VARCHAR(100) NULL,
+    expiry_date DATE NULL,
+    description VARCHAR(500) NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT pk_pb_stock_transaction_lines
+        PRIMARY KEY (id),
+
+    CONSTRAINT uq_pb_stock_transaction_lines_no
+        UNIQUE (stock_transaction_id, line_no),
+
+    CONSTRAINT fk_pb_stock_lines_transaction
+        FOREIGN KEY (stock_transaction_id)
+        REFERENCES pb_stock_transactions (id)
+        ON UPDATE RESTRICT
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_pb_stock_lines_warehouse
+        FOREIGN KEY (warehouse_id)
+        REFERENCES pb_warehouses (id)
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_pb_stock_lines_item
+        FOREIGN KEY (item_id)
+        REFERENCES pb_items (id)
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_pb_stock_lines_unit
+        FOREIGN KEY (unit_id)
+        REFERENCES pb_units (id)
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+
+    CONSTRAINT chk_pb_stock_lines_movement_qty
+        CHECK (movement_qty <> 0),
+
+    CONSTRAINT chk_pb_stock_lines_conversion
+        CHECK (conversion_rate > 0),
+
+    CONSTRAINT chk_pb_stock_lines_unit_cost
+        CHECK (unit_cost >= 0)
+) ENGINE=InnoDB;
+
+CREATE INDEX idx_pb_stock_lines_transaction_id
+    ON pb_stock_transaction_lines (stock_transaction_id);
+
+CREATE INDEX idx_pb_stock_lines_item_id
+    ON pb_stock_transaction_lines (item_id);
+
+CREATE INDEX idx_pb_stock_lines_warehouse_id
+    ON pb_stock_transaction_lines (warehouse_id);
+
+CREATE INDEX idx_pb_stock_lines_item_warehouse
+    ON pb_stock_transaction_lines (item_id, warehouse_id);
+
+
+-- =========================================================
+-- 10. ผู้จำหน่าย
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS pb_suppliers (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    supplier_code VARCHAR(30) NOT NULL,
+    supplier_name VARCHAR(255) NOT NULL,
+    tax_id VARCHAR(30) NULL,
+    contact_name VARCHAR(150) NULL,
+    phone_no VARCHAR(30) NULL,
+    email VARCHAR(255) NULL,
+    address_text TEXT NULL,
+    credit_term_days INT UNSIGNED NOT NULL DEFAULT 0,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+
+    CONSTRAINT pk_pb_suppliers
+        PRIMARY KEY (id),
+
+    CONSTRAINT uq_pb_suppliers_code
+        UNIQUE (supplier_code)
+) ENGINE=InnoDB;
+
+CREATE INDEX idx_pb_suppliers_name
+    ON pb_suppliers (supplier_name);
+
+
+-- =========================================================
+-- 11. สินค้าแยกตามผู้จำหน่าย
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS pb_item_suppliers (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    item_id BIGINT UNSIGNED NOT NULL,
+    supplier_id BIGINT UNSIGNED NOT NULL,
+    supplier_item_code VARCHAR(100) NULL,
+    purchase_unit_id BIGINT UNSIGNED NULL,
+    last_purchase_price DECIMAL(18,4) NOT NULL DEFAULT 0.0000,
+    lead_time_days INT UNSIGNED NOT NULL DEFAULT 0,
+    is_default BOOLEAN NOT NULL DEFAULT FALSE,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+
+    CONSTRAINT pk_pb_item_suppliers
+        PRIMARY KEY (id),
+
+    CONSTRAINT uq_pb_item_suppliers_item_supplier
+        UNIQUE (item_id, supplier_id),
+
+    CONSTRAINT fk_pb_item_suppliers_item
+        FOREIGN KEY (item_id)
+        REFERENCES pb_items (id)
+        ON UPDATE RESTRICT
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_pb_item_suppliers_supplier
+        FOREIGN KEY (supplier_id)
+        REFERENCES pb_suppliers (id)
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_pb_item_suppliers_unit
+        FOREIGN KEY (purchase_unit_id)
+        REFERENCES pb_units (id)
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+
+    CONSTRAINT chk_pb_item_suppliers_price
+        CHECK (last_purchase_price >= 0)
+) ENGINE=InnoDB;
+
+CREATE INDEX idx_pb_item_suppliers_supplier_id
+    ON pb_item_suppliers (supplier_id);
+=====================================================
+4. LOCAL DATABASE SCHEMA (Flutter Drift SQLite)
+import 'dart:io';
+import 'package:drift/drift.dart';
+import 'package:drift/native.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as p;
+
+part 'app_database.g.dart';
+
+class Pbitemgroups extends Table {
+  TextColumn get itemGroupCode => text().withLength(min: 1, max: 20)();
+  TextColumn get itemGroupName => text().withLength(min: 1, max: 100)();
+  TextColumn get parentGroupCode => text().nullable().references(Pbitemgroups, #itemGroupCode)();
+  IntColumn get sortOrder => integer().withDefault(const Constant(0))();
+  BoolColumn get isActive => boolean().withDefault(const Constant(true))();
+  DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
+
+  @override
+  Set<Column> get primaryKey => {itemGroupCode};
+}
+
+class Pbunitgroups extends Table {
+  TextColumn get unitGroupCode => text().withLength(min: 1, max: 20)();
+  TextColumn get unitGroupName => text().withLength(min: 1, max: 100)();
+  TextColumn get baseUnitCode => text().withLength(min: 1, max: 10)();
+  IntColumn get sortOrder => integer().withDefault(const Constant(0))();
+  BoolColumn get isActive => boolean().withDefault(const Constant(true))();
+  DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
+
+  @override
+  Set<Column> get primaryKey => {unitGroupCode};
+}
+
+class PbunitConversions extends Table {
+  TextColumn get unitCode => text().withLength(min: 1, max: 10)();
+  TextColumn get unitName => text().withLength(min: 1, max: 100)();
+  TextColumn get unitGroupCode => text().references(Pbunitgroups, #unitGroupCode)();
+  RealColumn get conversionFactor => real().withDefault(const Constant(1.0))();
+  IntColumn get sortOrder => integer().withDefault(const Constant(0))();
+  BoolColumn get isActive => boolean().withDefault(const Constant(true))();
+  DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
+
+  @override
+  Set<Column> get primaryKey => {unitCode};
+}
+
+class Pbitems extends Table {
+  TextColumn get itemCode => text().withLength(min: 5, max: 5)();
+  TextColumn get itemName => text().withLength(min: 1, max: 150)();
+  TextColumn get itemGroupCode => text().references(Pbitemgroups, #itemGroupCode)();
+  TextColumn get unitGroupCode => text().references(Pbunitgroups, #unitGroupCode)();
+  TextColumn get baseUnitCode => text().references(PbunitConversions, #unitCode)();
+  TextColumn get defaultSellUnitCode => text().nullable().references(PbunitConversions, #unitCode)();
+  TextColumn get defaultBuyUnitCode => text().nullable().references(PbunitConversions, #unitCode)();
+
+  BoolColumn get isRawMaterial => boolean().withDefault(const Constant(false))();
+  BoolColumn get isFinishedGood => boolean().withDefault(const Constant(false))();
+  BoolColumn get isSalesItem => boolean().withDefault(const Constant(false))();
+  BoolColumn get isPurchaseItem => boolean().withDefault(const Constant(false))();
+  BoolColumn get isLotControl => boolean().withDefault(const Constant(false))();
+
+  RealColumn get standardCost => real().withDefault(const Constant(0.0))();
+  RealColumn get averageCost => real().withDefault(const Constant(0.0))();
+  RealColumn get minStock => real().withDefault(const Constant(0.0))();
+  RealColumn get maxStock => real().withDefault(const Constant(0.0))();
+  BoolColumn get isActive => boolean().withDefault(const Constant(true))();
+  DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
+
+  @override
+  Set<Column> get primaryKey => {itemCode};
+}
+
+class PbitemUnits extends Table {
+  TextColumn get itemCode => text().references(Pbitems, #itemCode)();
+  TextColumn get itemName => text().withLength(min: 1, max: 150)();
+  TextColumn get unitCode => text().references(PbunitConversions, #unitCode)();
+  RealColumn get conversionFactor => real().withDefault(const Constant(1.0))();
+  BoolColumn get isBaseUnit => boolean().withDefault(const Constant(false))();
+  BoolColumn get isDefaultBuyUnit => boolean().withDefault(const Constant(false))();
+  BoolColumn get isDefaultSellUnit => boolean().withDefault(const Constant(false))();
+  DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
+
+  @override
+  Set<Column> get primaryKey => {itemCode, unitCode};
+}
+
+class PbitemBarcodes extends Table {
+  TextColumn get barcode => text().withLength(min: 1, max: 50)();
+  TextColumn get itemCode => text()();
+  TextColumn get unitCode => text()();
+  TextColumn get barcodeName => text().nullable()();
+  RealColumn get priceLevel1 => real().withDefault(const Constant(0.0))();
+  RealColumn get priceLevel2 => real().withDefault(const Constant(0.0))();
+  RealColumn get priceLevel3 => real().withDefault(const Constant(0.0))();
+  RealColumn get priceLevel4 => real().withDefault(const Constant(0.0))();
+  BoolColumn get isDefault => boolean().withDefault(const Constant(false))();
+  BoolColumn get isActive => boolean().withDefault(const Constant(true))();
+  DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
+
+  @override
+  Set<Column> get primaryKey => {barcode};
+
+  @override
+  List<String> get customConstraints => [
+    'FOREIGN KEY (item_code, unit_code) REFERENCES pbitem_units (item_code, unit_code) ON DELETE CASCADE'
+  ];
+}
+
+class SyncQueues extends Table {
+  IntColumn get queueId => integer().autoIncrement()();
+  TextColumn get tableName => text()();
+  TextColumn get actionType => text()(); // INSERT, UPDATE, DELETE
+  TextColumn get payloadJson => text()();
+  DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  BoolColumn get isSynced => boolean().withDefault(const Constant(false))();
+}
+
+@DriftDatabase(tables: [
+  Pbitemgroups,
+  Pbunitgroups,
+  PbunitConversions,
+  Pbitems,
+  PbitemUnits,
+  PbitemBarcodes,
+  SyncQueues,
+])
+class AppDatabase extends _$AppDatabase {
+  AppDatabase() : super(_openConnection());
+
+  @override
+  int get schemaVersion => 1;
+}
+
+LazyDatabase _openConnection() {
+  return LazyDatabase(() async {
+    final dbFolder = await getApplicationDocumentsDirectory();
+    final file = File(p.join(dbFolder.path, 'app_offline.sqlite'));
+    return NativeDatabase.createInBackground(file);
+  });
+}
+=====================================================
+5. GS1 BARCODE GENERATOR UTILITY
+JavaScript / Node.js:
+function calculateGS1CheckDigit(payload12) {
+  if (payload12.length !== 12) throw new Error('Payload must be exactly 12 digits');
+  let sum = 0;
+  for (let i = 0; i < 12; i++) {
+    const digit = parseInt(payload12[i], 10);
+    sum += (i % 2 === 0) ? digit * 1 : digit * 3;
+  }
+  const remainder = sum % 10;
+  return remainder === 0 ? 0 : 10 - remainder;
+}
+
+function generateGS1Barcode(itemCode, seq = 0) {
+  const prefix = "2191";
+  const paddedItemCode = String(itemCode).padStart(5, '0');
+  const paddedSeq = String(seq).padStart(3, '0');
+  const payload12 = `${prefix}${paddedItemCode}${paddedSeq}`;
+  return `${payload12}${calculateGS1CheckDigit(payload12)}`;
+}
+
+Dart / Flutter:
+class GS1BarcodeUtil {
+  static int calculateCheckDigit(String payload12) {
+    if (payload12.length != 12) throw ArgumentError('Payload must be exactly 12 digits');
+    int sum = 0;
+    for (int i = 0; i < 12; i++) {
+      int digit = int.parse(payload12[i]);
+      sum += (i % 2 == 0) ? digit * 1 : digit * 3;
+    }
+    int remainder = sum % 10;
+    return remainder == 0 ? 0 : 10 - remainder;
+  }
+
+  static String generateGS1Barcode(String itemCode, {int seq = 0}) {
+    const String prefix = "2191";
+    final String paddedItemCode = itemCode.padLeft(5, '0');
+    final String paddedSeq = seq.toString().padLeft(3, '0');
+    final String payload12 = "$prefix$paddedItemCode$paddedSeq";
+    return "$payload12${calculateCheckDigit(payload12)}";
+  }
+}
+=====================================================
+6. SELECTIVE OFFLINE SYNC SPECIFICATIONS
+ในฝั่ง Flutter App (SQLite) ใช้ตาราง sync_queue สะสมรายการ Transaction
+
+ทำ Module-Based Sync Profile:
+
+Sales_POS_Profile: ดึงเฉพาะสินค้าที่ isSalesItem = true, pbitem_unit, pbitem_barcode ลง SQLite
+
+Warehouse_Profile: ดึงเฉพาะรายการสต็อกและสินค้าที่รับเข้า/จ่ายออก
+
+เมื่อเชื่อมต่ออินเทอร์เน็ต ให้ Background Sync Worker อ่าน sync_queue แล้วส่งไปประมวลผลที่ Node.js Server
+
+=====================================================
+7. STEP-BY-STEP DEVELOPMENT PLAN
+โปรดสร้างระบบนี้โดยแบ่งงานเป็นเฟส:
+
+Phase 1: โครงสร้าง Flutter Data Models, Drift SQLite Tables, และ State Management
+Phase 2: Logic การ Generate Auto ItemCode 5 หลัก (Prefix Logic)
+Phase 3: UI Flutter Form Component (Cascading Dropdown, Dynamic Unit Grid พร้อม Auto-Fill Conversion Factor, Multi-Barcode/Price Section)
+Phase 4: Backend API Endpoints (Node.js/Express + PostgreSQL Transaction)
+Phase 5: Offline Sync Engine (SQLite Sync Queue, Selective Profile Sync, Background Auto-Sync Worker)
+
+หมายเหตุเพิ่มเติม
+1. ItemCode ต้องออกโดย Server เท่านั้น และสินค้าใหม่ที่สร้าง Offline จะใช้ UUID ชั่วคราวจนกว่าจะ Sync 
+2. ฉันอยากเพิ่ม ตาราง log สำหรับบันทึกการใช้งานขอผู้ใช้ด้วย
+3. ตอนส่งข้อมูลจากเครื่องลูกไปแม่ ถ้าบันทึกสำเร็จให้เครื่องส่งมาบอกเครื่องลูกด้วยจะได้แก้สถานะ Sync
+
+สถานะฐานข้อมูลของคุณ
+จากผลทดสอบถือว่าเรียบร้อยแล้ว:
+
+ฐานข้อมูล pb_erp ใช้งานได้
+ตารางครบ 11 ตาราง
+Primary key ถูกสร้างแล้ว
+Foreign key พบ 16 รายการ
+ผู้ใช้ pb_api@127.0.0.1 มีสิทธิ์บน pb_erp
+รหัสผ่านชั่วคราวคือ 1234
+
+ส่วนระบบ			ตำแหน่ง
+โครงการหลัก	D:\erp_pos_system
+Flutter Application	D:\erp_pos_system\apps\erp_pos_flutter
+ไฟล์เริ่มต้น Flutter	D:\erp_pos_system\apps\erp_pos_flutter\lib\main.dart
+Backend API	D:\erp_pos_system\services\erp_pos_api
+Backend .env	D:\erp_pos_system\services\erp_pos_api\.env
+ไฟล์ฐานข้อมูล	D:\erp_pos_system\database
+เอกสาร	D:\erp_pos_system\docs
+
+ส่วนโครงการ Dart Backend ยังไม่สมบูรณ์ เพราะยังไม่มี pubspec.yaml, bin และ lib
+
+PS D:\erp_pos_system> dir -Recurse
+
+
+    Directory: D:\erp_pos_system
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:08 PM                apps
+d-----          9/1/2026  12:59 PM                database
+d-----          9/1/2026  12:59 PM                docs
+d-----          9/2/2026   9:53 AM                services
+d-----          9/2/2026   8:15 AM                โปรแกรม
+-a----          9/2/2026  10:10 AM            518 ERP.bat
+
+
+    Directory: D:\erp_pos_system\apps
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:37 PM                erp_pos_flutter
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:23 PM                .dart_tool
+d-----          9/1/2026   1:08 PM                .idea
+d-----          9/1/2026   1:08 PM                android
+d-----          9/2/2026   5:25 AM                build
+d-----          9/1/2026   1:08 PM                ios
+d-----          9/1/2026   2:02 PM                lib
+d-----          9/1/2026   1:08 PM                test
+d-----          9/1/2026   1:08 PM                windows
+-a----          9/1/2026   1:27 PM           3865 .flutter-plugins-dependencies
+-a----          9/1/2026   1:08 PM            748 .gitignore
+-a----          9/1/2026   1:08 PM           1264 .metadata
+-a----          9/1/2026   1:08 PM           1448 analysis_options.yaml
+-a----          9/1/2026   1:08 PM            859 erp_pos_flutter.iml
+-a----          9/1/2026   2:01 PM          28165 pubspec.lock
+-a----          9/1/2026   2:01 PM           4355 pubspec.yaml
+-a----          9/1/2026   1:08 PM            654 README.md
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   2:18 PM                build
+d-----          9/1/2026   2:18 PM                build_resolvers
+d-----          9/1/2026   2:06 PM                extension_discovery
+d-----          9/1/2026   7:23 PM                flutter_build
+d-----          9/1/2026   7:23 PM                hooks_runner
+d-----          9/1/2026   2:17 PM                pub
+-a----          9/1/2026   2:01 PM          24933 package_config.json
+-a----          9/1/2026   2:01 PM          22396 package_graph.json
+-a----          9/2/2026  10:11 AM              6 version
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\build
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   2:18 PM                entrypoint
+d-----          9/1/2026   2:18 PM                generated
+d-----          9/1/2026   2:17 PM                lock
+-a----          9/1/2026   7:15 PM         626713 asset_graph.json
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\build\entrypoint
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   2:17 PM           1048 build.dart
+-a----          9/1/2026   2:18 PM       16666928 build.dart.aot
+-a----          9/1/2026   2:17 PM         181446 build.dart.aot.deps
+-a----          9/1/2026   2:18 PM             24 build.dart.aot.digest
+-a----          9/1/2026   2:17 PM              0 build.dart.aot.digest.stamp
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\build\generated
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   2:18 PM                erp_pos_flutter
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\build\generated\erp_pos_flutter
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   2:18 PM                lib
+d-----          9/1/2026   2:18 PM                test
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\build\generated\erp_pos_flutter\lib
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   2:18 PM                data
+-a----          9/1/2026   2:18 PM            106 main.dart.drift_elements.json
+-a----          9/1/2026   2:18 PM             76 main.dart.drift_module.json
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\build\generated\erp_pos_flutter\lib\data
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   2:18 PM                database
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\build\generated\erp_pos_flutter\lib\data\database
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   2:18 PM                tables
+-a----          9/1/2026   2:18 PM            325 app_database.dart.drift_elements.json
+-a----          9/1/2026   2:18 PM           1014 app_database.dart.drift_module.json
+-a----          9/1/2026   2:18 PM          33640 app_database.drift.g.part
+
+
+    Directory:
+    D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\build\generated\erp_pos_flutter\lib\data\database\tables
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   2:18 PM            158 products.dart.drift_elements.json
+-a----          9/1/2026   7:15 PM          11109 products.dart.drift_module.json
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\build\generated\erp_pos_flutter\test
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   2:18 PM            237 widget_test.dart.drift_elements.json
+-a----          9/1/2026   2:18 PM            163 widget_test.dart.drift_module.json
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\build\lock
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   7:15 PM              0 build_runner.lock
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\build_resolvers
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   2:18 PM        3671818 sdk.sum
+-a----          9/1/2026   2:18 PM            268 sdk.sum.deps
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\extension_discovery
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   2:06 PM             91 vs_code.json
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\flutter_build
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                81ef118f827f45d1e3dc0a79d6c4030c
+-a----          9/1/2026   7:23 PM           2798 dart_plugin_registrant.dart
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\flutter_build\81ef118f827f45d1e3dc0a79d6c4030c
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/2/2026   5:25 AM         240236 .filecache
+-a----          9/2/2026   5:24 AM       55896592 app.dill
+-a----          9/2/2026   5:14 AM            507 dart_build.d
+-a----          9/2/2026   5:14 AM            844 dart_build.stamp
+-a----          9/2/2026   5:14 AM            711 dart_build_result.json
+-a----          9/2/2026   5:25 AM          12585 debug_bundle_windows-x64_assets.stamp
+-a----          9/2/2026   5:25 AM          12096 flutter_assets.d
+-a----          9/1/2026   7:23 PM            201 gen_dart_plugin_registrant.stamp
+-a----          9/2/2026   5:24 AM             26 gen_localizations.stamp
+-a----          9/2/2026   5:14 AM            335 install_code_assets.d
+-a----          9/2/2026   5:14 AM            791 install_code_assets.stamp
+-a----          9/2/2026   5:24 AM         131854 kernel_snapshot_program.d
+-a----          9/2/2026   5:24 AM         135069 kernel_snapshot_program.stamp
+-a----          9/2/2026   5:14 AM            131 native_assets.json
+-a----          9/2/2026   5:25 AM           6467 outputs.json
+-a----          9/1/2026   1:24 PM          10727 unpack_windows.stamp
+-a----          9/1/2026   1:24 PM          10430 windows_engine_sources.d
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\hooks_runner
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:24 PM                objective_c
+d-----          9/1/2026   7:23 PM                shared
+d-----          9/1/2026   7:24 PM                sqlite3
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\hooks_runner\objective_c
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:24 PM                337ce265dc
+d-----          9/1/2026   7:23 PM                63dc6ceb2b
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\hooks_runner\objective_c\337ce265dc
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:24 PM                out
+-a----          9/2/2026   5:25 AM            170 .lock
+-a----          9/1/2026   7:24 PM            401 dependencies.dependencies_hash_file.json
+-a----          9/1/2026   7:24 PM            346 hook.dependencies_hash_file.json
+-a----          9/1/2026   7:24 PM       10667600 hook.dill
+-a----          9/1/2026   7:24 PM          14762 hook.dill.d
+-a----          9/1/2026   7:24 PM            498 input.json
+-a----          9/1/2026   7:24 PM             95 output.json
+-a----          9/1/2026   7:24 PM              0 stderr.txt
+-a----          9/1/2026   7:24 PM           1990 stdout.txt
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\hooks_runner\objective_c\63dc6ceb2b
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:23 PM                out
+-a----          9/2/2026   5:14 AM            169 .lock
+-a----          9/1/2026   7:23 PM            400 dependencies.dependencies_hash_file.json
+-a----          9/1/2026   7:23 PM            346 hook.dependencies_hash_file.json
+-a----          9/1/2026   7:23 PM       10667600 hook.dill
+-a----          9/1/2026   7:23 PM          14762 hook.dill.d
+-a----          9/1/2026   7:23 PM           1380 input.json
+-a----          9/1/2026   7:23 PM             95 output.json
+-a----          9/1/2026   7:23 PM              0 stderr.txt
+-a----          9/1/2026   7:23 PM           2684 stdout.txt
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\hooks_runner\shared
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:23 PM                objective_c
+d-----          9/1/2026   7:23 PM                sqlite3
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\hooks_runner\shared\objective_c
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:24 PM                build
+-a----          9/2/2026   5:25 AM            170 .lock
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\hooks_runner\shared\objective_c\build
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:24 PM                337ce265dc
+d-----          9/1/2026   7:23 PM                63dc6ceb2b
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\hooks_runner\shared\sqlite3
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:24 PM                build
+-a----          9/2/2026   5:25 AM            170 .lock
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\hooks_runner\shared\sqlite3\build
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:24 PM                337ce265dc
+d-----          9/1/2026   7:23 PM                63dc6ceb2b
+d-----          9/1/2026   7:23 PM                download-2bf39f2a
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\hooks_runner\shared\sqlite3\build\download-2bf39f2a
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   7:23 PM        1709056 sqlite3.dll
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\hooks_runner\sqlite3
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:24 PM                337ce265dc
+d-----          9/1/2026   7:23 PM                63dc6ceb2b
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\hooks_runner\sqlite3\337ce265dc
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:24 PM                out
+-a----          9/2/2026   5:25 AM            170 .lock
+-a----          9/1/2026   7:24 PM            401 dependencies.dependencies_hash_file.json
+-a----          9/1/2026   7:24 PM            346 hook.dependencies_hash_file.json
+-a----          9/1/2026   7:24 PM       11815000 hook.dill
+-a----          9/1/2026   7:24 PM          29995 hook.dill.d
+-a----          9/1/2026   7:24 PM            482 input.json
+-a----          9/1/2026   7:24 PM             95 output.json
+-a----          9/1/2026   7:24 PM              0 stderr.txt
+-a----          9/1/2026   7:24 PM           1978 stdout.txt
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\hooks_runner\sqlite3\63dc6ceb2b
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:23 PM                out
+-a----          9/2/2026   5:14 AM            169 .lock
+-a----          9/1/2026   7:23 PM            400 dependencies.dependencies_hash_file.json
+-a----          9/1/2026   7:23 PM            346 hook.dependencies_hash_file.json
+-a----          9/1/2026   7:23 PM       11815000 hook.dill
+-a----          9/1/2026   7:23 PM          29995 hook.dill.d
+-a----          9/1/2026   7:23 PM           1364 input.json
+-a----          9/1/2026   7:23 PM            466 output.json
+-a----          9/1/2026   7:23 PM              0 stderr.txt
+-a----          9/1/2026   7:23 PM           2672 stdout.txt
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\pub
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   2:17 PM                bin
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\pub\bin
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   2:17 PM                build_runner
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.dart_tool\pub\bin\build_runner
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   2:17 PM       27139400 build_runner.dart-3.12.2.snapshot
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.idea
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:08 PM                libraries
+d-----          9/1/2026   1:08 PM                runConfigurations
+-a----          9/1/2026   1:08 PM            425 modules.xml
+-a----          9/1/2026   1:08 PM           1553 workspace.xml
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.idea\libraries
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   1:08 PM            970 Dart_SDK.xml
+-a----          9/1/2026   1:08 PM            614 KotlinJavaRuntime.xml
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\.idea\runConfigurations
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   1:08 PM            276 main_dart.xml
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:08 PM                app
+d-----          9/1/2026   1:08 PM                gradle
+-a----          7/7/2026   1:10 PM            267 .gitignore
+-a----          9/1/2026   1:08 PM            561 build.gradle.kts
+-a----          9/1/2026   1:08 PM           1630 erp_pos_flutter_android.iml
+-a----          9/1/2026   1:08 PM            306 gradle.properties
+-a----          9/1/2026   1:08 PM           4971 gradlew
+-a----          9/1/2026   1:08 PM           2404 gradlew.bat
+-a----          9/1/2026   1:08 PM             83 local.properties
+-a----          9/1/2026   1:08 PM            797 settings.gradle.kts
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:08 PM                src
+-a----          9/1/2026   1:08 PM           1458 build.gradle.kts
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:08 PM                debug
+d-----          9/1/2026   1:09 PM                main
+d-----          9/1/2026   1:08 PM                profile
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\debug
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   1:08 PM            385 AndroidManifest.xml
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:09 PM                java
+d-----          9/1/2026   1:08 PM                kotlin
+d-----          9/1/2026   1:08 PM                res
+-a----          9/1/2026   1:08 PM           2248 AndroidManifest.xml
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\java
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:09 PM                io
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\java\io
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:09 PM                flutter
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\java\io\flutter
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:09 PM                plugins
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\java\io\flutter\plugins
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   1:27 PM           1253 GeneratedPluginRegistrant.java
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\kotlin
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:08 PM                com
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\kotlin\com
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:08 PM                yourcompany
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\kotlin\com\yourcompany
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:08 PM                erp_pos_flutter
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\kotlin\com\yourcompany\erp_pos_flutter
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   1:08 PM            138 MainActivity.kt
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\res
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:08 PM                drawable
+d-----          9/1/2026   1:08 PM                drawable-v21
+d-----          9/1/2026   1:08 PM                mipmap-hdpi
+d-----          9/1/2026   1:08 PM                mipmap-mdpi
+d-----          9/1/2026   1:08 PM                mipmap-xhdpi
+d-----          9/1/2026   1:08 PM                mipmap-xxhdpi
+d-----          9/1/2026   1:08 PM                mipmap-xxxhdpi
+d-----          9/1/2026   1:08 PM                values
+d-----          9/1/2026   1:08 PM                values-night
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\res\drawable
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:10 PM            446 launch_background.xml
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\res\drawable-v21
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:10 PM            450 launch_background.xml
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\res\mipmap-hdpi
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:10 PM            544 ic_launcher.png
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\res\mipmap-mdpi
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:10 PM            442 ic_launcher.png
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\res\mipmap-xhdpi
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:10 PM            721 ic_launcher.png
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\res\mipmap-xxhdpi
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:10 PM           1031 ic_launcher.png
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\res\mipmap-xxxhdpi
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:10 PM           1443 ic_launcher.png
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\res\values
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:10 PM           1014 styles.xml
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\main\res\values-night
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:10 PM           1013 styles.xml
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\app\src\profile
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   1:08 PM            385 AndroidManifest.xml
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\gradle
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:08 PM                wrapper
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\android\gradle\wrapper
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   1:08 PM          53636 gradle-wrapper.jar
+-a----          9/1/2026   1:08 PM            207 gradle-wrapper.properties
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                dce79ec51bf557493739c815262ca6ba
+d-----          9/2/2026   5:24 AM                flutter_assets
+d-----          9/1/2026   1:24 PM                native_assets
+d-----          9/1/2026   1:24 PM                windows
+-a----          9/1/2026   1:24 PM             32 .last_build_id
+-a----          9/2/2026   5:24 AM       55896592 e09161ed6a8240f7110db5db6f6e90b3.cache.dill.track.dill
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\dce79ec51bf557493739c815262ca6ba
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/2/2026   5:24 AM            201 gen_dart_plugin_registrant.stamp
+-a----          9/2/2026   5:24 AM             26 gen_localizations.stamp
+-a----          9/1/2026   1:24 PM             26 _composite.stamp
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\flutter_assets
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:24 AM                fonts
+d-----          9/1/2026   1:24 PM                packages
+d-----          9/2/2026   5:25 AM                shaders
+-a----          9/2/2026   5:24 AM            117 AssetManifest.bin
+-a----          9/2/2026   5:24 AM            208 FontManifest.json
+-a----          9/2/2026   5:24 AM       55896592 kernel_blob.bin
+-a----          9/2/2026   5:14 AM            131 NativeAssetsManifest.json
+-a----          9/2/2026   5:24 AM         113900 NOTICES.Z
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\flutter_assets\fonts
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:17 PM        1645184 MaterialIcons-Regular.otf
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\flutter_assets\packages
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                cupertino_icons
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\flutter_assets\packages\cupertino_icons
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:24 AM                assets
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\flutter_assets\packages\cupertino_icons\assets
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:29 PM         257628 CupertinoIcons.ttf
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\flutter_assets\shaders
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/2/2026   5:24 AM          21856 ink_sparkle.frag
+-a----          9/2/2026   5:25 AM          17624 stretch_effect.frag
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\native_assets
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:14 AM                windows
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\native_assets\windows
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   7:23 PM        1709056 sqlite3.dll
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:24 AM                x64
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                ALL_BUILD.dir
+d-----          9/2/2026   5:24 AM                CMakeFiles
+d-----          9/2/2026   5:24 AM                flutter
+d-----          9/1/2026   1:24 PM                INSTALL.dir
+d-----          9/1/2026   7:23 PM                plugins
+d-----          9/2/2026   5:24 AM                runner
+d-----          9/1/2026   1:24 PM                x64
+d-----          9/1/2026   1:24 PM                ZERO_CHECK.dir
+-a----          9/1/2026   7:23 PM          21585 ALL_BUILD.vcxproj
+-a----          9/1/2026   1:24 PM            301 ALL_BUILD.vcxproj.filters
+-a----          9/1/2026   7:23 PM          18655 CMakeCache.txt
+-a----          9/2/2026   5:24 AM          19877 cmake_install.cmake
+-a----          9/1/2026   7:23 PM           2616 erp_pos_flutter.slnx
+-a----          9/1/2026   1:24 PM           8789 INSTALL.vcxproj
+-a----          9/1/2026   1:24 PM            547 INSTALL.vcxproj.filters
+-a----          9/2/2026   5:25 AM           1402 install_manifest.txt
+-a----          9/2/2026   5:14 AM          30255 ZERO_CHECK.vcxproj
+-a----          9/1/2026   1:24 PM            548 ZERO_CHECK.vcxproj.filters
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\ALL_BUILD.dir
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                Debug
+d-----          9/1/2026   1:24 PM                Profile
+d-----          9/1/2026   1:24 PM                Release
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                1f7c399431038254668f96118ef90fb8
+d-----          9/1/2026   7:23 PM                291beefc51403d177b36fb7be67b5162
+d-----          9/1/2026   7:23 PM                4.3.1-msvc1
+d-----          9/1/2026   1:24 PM                4c4ce7205ac78ad68d2ef0c574818506
+d-----          9/1/2026   1:24 PM                8ddccb100147515345f94dbfd34a924c
+d-----          9/1/2026   1:24 PM                afb9dbf27c6f0daee90de6390dab8b7d
+d-----          9/1/2026   7:23 PM                c3f00f99de973400249981bc5c40f8f2
+d-----          9/1/2026   7:23 PM                e052b067f00c5c5a643e946056a1a112
+d-----          9/2/2026   5:24 AM                pkgRedirects
+-a----          9/2/2026   5:24 AM             86 cmake.check_cache
+-a----          9/1/2026   7:23 PM         109984 CMakeConfigureLog.yaml
+-a----          9/2/2026   5:24 AM             55 generate.stamp
+-a----          9/2/2026   5:24 AM           4036 generate.stamp.depend
+-a----          9/2/2026   5:24 AM            576 generate.stamp.list
+-a----          9/2/2026   5:24 AM            627 InstallScripts.json
+-a----          9/2/2026   5:24 AM           1644 TargetDirectories.txt
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\1f7c399431038254668f96118ef90fb8
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          1/1/2001   7:00 AM             24 generate.stamp.rule
+-a----          1/1/2001   7:00 AM             24 INSTALL_force.rule
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\291beefc51403d177b36fb7be67b5162
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          1/1/2001   7:00 AM             24 INSTALL_force.rule
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\4.3.1-msvc1
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:23 PM                CompilerIdC
+d-----          9/1/2026   1:24 PM                CompilerIdCXX
+d-----          9/1/2026   1:24 PM                VCTargetsPath
+d-----          9/1/2026   1:24 PM                x64
+-a----          9/1/2026   7:23 PM           3261 CMakeCCompiler.cmake
+-a----          9/1/2026   1:24 PM           6480 CMakeCXXCompiler.cmake
+-a----          9/1/2026   7:23 PM          51712 CMakeDetermineCompilerABI_C.bin
+-a----          9/1/2026   1:24 PM          51712 CMakeDetermineCompilerABI_CXX.bin
+-a----          9/1/2026   1:24 PM            212 CMakeRCCompiler.cmake
+-a----          9/1/2026   1:24 PM            395 CMakeSystem.cmake
+-a----          9/1/2026   1:24 PM             81 VCTargetsPath.txt
+-a----          9/1/2026   1:24 PM           1255 VCTargetsPath.vcxproj
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\4.3.1-msvc1\CompilerIdC
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:23 PM                Debug
+d-----          9/1/2026   7:23 PM                tmp
+-a----          9/1/2026   7:23 PM          29602 CMakeCCompilerId.c
+-a----          9/1/2026   7:23 PM          14848 CompilerIdC.exe
+-a----          9/1/2026   7:23 PM           2798 CompilerIdC.vcxproj
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\4.3.1-msvc1\CompilerIdC\Debug
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:23 PM                CompilerIdC.tlog
+-a----          9/1/2026   7:23 PM           2311 CMakeCCompilerId.obj
+-a----          9/1/2026   7:23 PM            350 CompilerIdC.exe.recipe
+
+
+    Directory:
+    D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\4.3.1-msvc1\CompilerIdC\Debug\CompilerIdC.tlog
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   7:23 PM            824 CL.command.1.tlog
+-a----          9/1/2026   7:23 PM            231 Cl.items.tlog
+-a----          9/1/2026   7:23 PM            390 CL.read.1.tlog
+-a----          9/1/2026   7:23 PM            468 CL.write.1.tlog
+-a----          9/1/2026   7:23 PM            336 CompilerIdC.lastbuildstate
+-a----          9/1/2026   7:23 PM           1066 link.command.1.tlog
+-a----          9/1/2026   7:23 PM           3446 link.read.1.tlog
+-a----          9/1/2026   7:23 PM            121 link.secondary.1.tlog
+-a----          9/1/2026   7:23 PM            462 link.write.1.tlog
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\4.3.1-msvc1\CompilerIdCXX
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                Debug
+d-----          9/1/2026   1:24 PM                tmp
+-a----          9/1/2026   1:24 PM          30429 CMakeCXXCompilerId.cpp
+-a----          9/1/2026   1:24 PM          14848 CompilerIdCXX.exe
+-a----          9/1/2026   1:24 PM           2806 CompilerIdCXX.vcxproj
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\4.3.1-msvc1\CompilerIdCXX\Debug
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                CompilerIdCXX.tlog
+-a----          9/1/2026   1:24 PM           2375 CMakeCXXCompilerId.obj
+-a----          9/1/2026   1:24 PM            354 CompilerIdCXX.exe.recipe
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\4.3.1-msvc1\CompilerIdCXX\Debug\Comp
+    ilerIdCXX.tlog
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   1:24 PM            848 CL.command.1.tlog
+-a----          9/1/2026   1:24 PM            241 Cl.items.tlog
+-a----          9/1/2026   1:24 PM            402 CL.read.1.tlog
+-a----          9/1/2026   1:24 PM            488 CL.write.1.tlog
+-a----          9/1/2026   1:24 PM            338 CompilerIdCXX.lastbuildstate
+-a----          9/1/2026   1:24 PM           1090 link.command.1.tlog
+-a----          9/1/2026   1:24 PM           3462 link.read.1.tlog
+-a----          9/1/2026   1:24 PM            125 link.secondary.1.tlog
+-a----          9/1/2026   1:24 PM            478 link.write.1.tlog
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\4.3.1-msvc1\VCTargetsPath
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                x64
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\4.3.1-msvc1\VCTargetsPath\x64
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                Debug
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\4.3.1-msvc1\VCTargetsPath\x64\Debug
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                VCTargetsPath.tlog
+-a----          9/1/2026   1:24 PM            346 VCTargetsPath.recipe
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\4.3.1-msvc1\VCTargetsPath\x64\Debug\
+    VCTargetsPath.tlog
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   1:24 PM            324 VCTargetsPath.lastbuildstate
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\4.3.1-msvc1\x64
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                Debug
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\4c4ce7205ac78ad68d2ef0c574818506
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          1/1/2001   7:00 AM             24 flutter_windows.dll.rule
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\8ddccb100147515345f94dbfd34a924c
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          1/1/2001   7:00 AM             24 flutter_assemble.rule
+-a----          1/1/2001   7:00 AM             24 INSTALL_force.rule
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\afb9dbf27c6f0daee90de6390dab8b7d
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          1/1/2001   7:00 AM             24 INSTALL_force.rule
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\c3f00f99de973400249981bc5c40f8f2
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          1/1/2001   7:00 AM             24 INSTALL_force.rule
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\CMakeFiles\e052b067f00c5c5a643e946056a1a112
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          1/1/2001   7:00 AM             24 INSTALL_force.rule
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\flutter
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:24 AM                CMakeFiles
+d-----          9/1/2026   1:25 PM                Debug
+d-----          9/1/2026   1:24 PM                flutter_assemble.dir
+d-----          9/1/2026   1:24 PM                flutter_wrapper_app.dir
+d-----          9/1/2026   1:24 PM                flutter_wrapper_plugin.dir
+d-----          9/1/2026   1:24 PM                INSTALL.dir
+d-----          9/1/2026   1:24 PM                x64
+-a----          9/2/2026   5:24 AM           1359 cmake_install.cmake
+-a----          9/1/2026   1:24 PM          27197 flutter_assemble.vcxproj
+-a----          9/1/2026   1:24 PM           1010 flutter_assemble.vcxproj.filters
+-a----          9/1/2026   1:24 PM          18655 flutter_wrapper_app.vcxproj
+-a----          9/1/2026   1:24 PM           1360 flutter_wrapper_app.vcxproj.filters
+-a----          9/1/2026   1:24 PM          18538 flutter_wrapper_plugin.vcxproj
+-a----          9/1/2026   1:24 PM           1169 flutter_wrapper_plugin.vcxproj.filters
+-a----          9/1/2026   1:24 PM           8820 INSTALL.vcxproj
+-a----          9/1/2026   1:24 PM            547 INSTALL.vcxproj.filters
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\flutter\CMakeFiles
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/2/2026   5:24 AM             55 generate.stamp
+-a----          9/2/2026   5:24 AM            216 generate.stamp.depend
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\flutter\Debug
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   1:25 PM        9998112 flutter_wrapper_app.lib
+-a----          9/1/2026   1:25 PM        1495040 flutter_wrapper_app.pdb
+-a----          9/1/2026   1:25 PM       10096174 flutter_wrapper_plugin.lib
+-a----          9/1/2026   1:25 PM        1339392 flutter_wrapper_plugin.pdb
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\flutter\flutter_assemble.dir
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                Debug
+d-----          9/1/2026   1:24 PM                Profile
+d-----          9/1/2026   1:24 PM                Release
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\flutter\flutter_wrapper_app.dir
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:25 PM                Debug
+d-----          9/1/2026   1:24 PM                Profile
+d-----          9/1/2026   1:24 PM                Release
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\flutter\flutter_wrapper_app.dir\Debug
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:25 AM                flutter_.76C5C6CE.tlog
+-a----          9/1/2026   1:25 PM        2766502 core_implementations.obj
+-a----          9/1/2026   1:25 PM         393959 flutter_engine.obj
+-a----          9/1/2026   1:25 PM         208781 flutter_view_controller.obj
+-a----          9/2/2026   5:25 AM            483 flutter_wrapper_app.lib.recipe
+-a----          9/1/2026   1:25 PM        5036503 standard_codec.obj
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\flutter\flutter_wrapper_app.dir\Debug\flutter_.
+    76C5C6CE.tlog
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   1:25 PM           5982 CL.command.1.tlog
+-a----          9/2/2026   5:25 AM            898 Cl.items.tlog
+-a----          9/1/2026   1:25 PM         164554 CL.read.1.tlog
+-a----          9/1/2026   1:25 PM           3624 CL.write.1.tlog
+-a----          9/1/2026   1:24 PM            595 CustomBuild.command.1.tlog
+-a----          9/1/2026   1:24 PM            161 CustomBuild.read.1.tlog
+-a----          9/1/2026   1:24 PM            164 CustomBuild.write.1.tlog
+-a----          9/2/2026   5:25 AM            309 flutter_wrapper_app.lastbuildstate
+-a----          9/1/2026   1:25 PM           2060 Lib-link.read.1.tlog
+-a----          9/1/2026   1:25 PM           1140 Lib-link.write.1.tlog
+-a----          9/1/2026   1:25 PM           1652 Lib.command.1.tlog
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\flutter\flutter_wrapper_plugin.dir
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:25 PM                Debug
+d-----          9/1/2026   1:24 PM                Profile
+d-----          9/1/2026   1:24 PM                Release
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\flutter\flutter_wrapper_plugin.dir\Debug
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:25 AM                flutter_.D19AACBC.tlog
+-a----          9/1/2026   1:25 PM        2766506 core_implementations.obj
+-a----          9/2/2026   5:25 AM            483 flutter_wrapper_plugin.lib.recipe
+-a----          9/1/2026   1:25 PM         615797 plugin_registrar.obj
+-a----          9/1/2026   1:25 PM        5036511 standard_codec.obj
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\flutter\flutter_wrapper_plugin.dir\Debug\flutte
+    r_.D19AACBC.tlog
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   1:25 PM           4510 CL.command.1.tlog
+-a----          9/2/2026   5:25 AM            676 Cl.items.tlog
+-a----          9/1/2026   1:25 PM          88292 CL.read.1.tlog
+-a----          9/1/2026   1:25 PM           2790 CL.write.1.tlog
+-a----          9/1/2026   1:25 PM            595 CustomBuild.command.1.tlog
+-a----          9/1/2026   1:25 PM            161 CustomBuild.read.1.tlog
+-a----          9/1/2026   1:25 PM            164 CustomBuild.write.1.tlog
+-a----          9/2/2026   5:25 AM            309 flutter_wrapper_plugin.lastbuildstate
+-a----          9/1/2026   1:25 PM           1610 Lib-link.read.1.tlog
+-a----          9/1/2026   1:25 PM            922 Lib-link.write.1.tlog
+-a----          9/1/2026   1:25 PM           1338 Lib.command.1.tlog
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\flutter\INSTALL.dir
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                Debug
+d-----          9/1/2026   1:24 PM                Profile
+d-----          9/1/2026   1:24 PM                Release
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\flutter\x64
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                Debug
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\flutter\x64\Debug
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                flutter_assemble
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\flutter\x64\Debug\flutter_assemble
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:25 AM                flutter_assemble.tlog
+-a----          9/2/2026   5:25 AM            483 flutter_assemble.recipe
+
+
+    Directory:
+    D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\flutter\x64\Debug\flutter_assemble\flutter_assemble.tlog
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/2/2026   5:24 AM           2147 CustomBuild.command.1.tlog
+-a----          9/2/2026   5:24 AM           1472 CustomBuild.read.1.tlog
+-a----          9/2/2026   5:24 AM           1643 CustomBuild.write.1.tlog
+-a----          9/2/2026   5:25 AM            309 flutter_assemble.lastbuildstate
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\INSTALL.dir
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                Debug
+d-----          9/1/2026   1:24 PM                Profile
+d-----          9/1/2026   1:24 PM                Release
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\plugins
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:24 AM                connectivity_plus
+d-----          9/2/2026   5:24 AM                jni
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\plugins\connectivity_plus
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:23 PM                ALL_BUILD.dir
+d-----          9/2/2026   5:24 AM                CMakeFiles
+d-----          9/1/2026   7:23 PM                connectivity_plus_plugin.dir
+d-----          9/1/2026   7:24 PM                Debug
+d-----          9/1/2026   7:23 PM                INSTALL.dir
+-a----          9/1/2026   7:23 PM           9544 ALL_BUILD.vcxproj
+-a----          9/1/2026   7:23 PM            362 ALL_BUILD.vcxproj.filters
+-a----          9/2/2026   5:24 AM           1430 cmake_install.cmake
+-a----          9/1/2026   7:23 PM           1879 connectivity_plus.slnx
+-a----          9/1/2026   7:23 PM          23737 connectivity_plus_plugin.vcxproj
+-a----          9/1/2026   7:23 PM            957 connectivity_plus_plugin.vcxproj.filters
+-a----          9/1/2026   7:23 PM           8893 INSTALL.vcxproj
+-a----          9/1/2026   7:23 PM            547 INSTALL.vcxproj.filters
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\plugins\connectivity_plus\ALL_BUILD.dir
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:23 PM                Debug
+d-----          9/1/2026   7:23 PM                Profile
+d-----          9/1/2026   7:23 PM                Release
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\plugins\connectivity_plus\CMakeFiles
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/2/2026   5:24 AM             55 generate.stamp
+-a----          9/2/2026   5:24 AM            180 generate.stamp.depend
+
+
+    Directory:
+    D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\plugins\connectivity_plus\connectivity_plus_plugin.dir
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:24 PM                Debug
+d-----          9/1/2026   7:23 PM                Profile
+d-----          9/1/2026   7:23 PM                Release
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\plugins\connectivity_plus\connectivity_plus_plu
+    gin.dir\Debug
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:25 AM                connecti.8B454B3E.tlog
+-a----          9/2/2026   5:25 AM            672 connectivity_plus_plugin.dll.recipe
+-a----          9/1/2026   7:24 PM        6478494 connectivity_plus_plugin.ilk
+-a----          9/1/2026   7:23 PM        4327090 connectivity_plus_plugin.obj
+-a----          9/1/2026   7:23 PM         574486 network_manager.obj
+-a----          9/1/2026   7:23 PM        1404928 vc145.pdb
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\plugins\connectivity_plus\connectivity_plus_plu
+    gin.dir\Debug\connecti.8B454B3E.tlog
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   7:23 PM           3306 CL.command.1.tlog
+-a----          9/2/2026   5:25 AM            552 Cl.items.tlog
+-a----          9/1/2026   7:23 PM         102068 CL.read.1.tlog
+-a----          9/1/2026   7:23 PM           2422 CL.write.1.tlog
+-a----          9/2/2026   5:25 AM            327 connectivity_plus_plugin.lastbuildstate
+-a----          9/1/2026   7:23 PM            666 CustomBuild.command.1.tlog
+-a----          9/1/2026   7:23 PM            125 CustomBuild.read.1.tlog
+-a----          9/1/2026   7:23 PM            235 CustomBuild.write.1.tlog
+-a----          9/1/2026   7:24 PM           2576 link.command.1.tlog
+-a----          9/1/2026   7:24 PM           5226 link.read.1.tlog
+-a----          9/1/2026   7:24 PM            673 link.secondary.1.tlog
+-a----          9/1/2026   7:24 PM           1052 link.write.1.tlog
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\plugins\connectivity_plus\Debug
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   7:24 PM        1347072 connectivity_plus_plugin.dll
+-a----          9/1/2026   7:24 PM            969 connectivity_plus_plugin.exp
+-a----          9/1/2026   7:24 PM           2206 connectivity_plus_plugin.lib
+-a----          9/1/2026   7:24 PM        9424896 connectivity_plus_plugin.pdb
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\plugins\connectivity_plus\INSTALL.dir
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:23 PM                Debug
+d-----          9/1/2026   7:23 PM                Profile
+d-----          9/1/2026   7:23 PM                Release
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\plugins\jni
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:23 PM                ALL_BUILD.dir
+d-----          9/2/2026   5:24 AM                CMakeFiles
+d-----          9/1/2026   7:23 PM                INSTALL.dir
+d-----          9/2/2026   5:24 AM                shared
+-a----          9/1/2026   7:23 PM           9119 ALL_BUILD.vcxproj
+-a----          9/1/2026   7:23 PM            348 ALL_BUILD.vcxproj.filters
+-a----          9/2/2026   5:24 AM           1611 cmake_install.cmake
+-a----          9/1/2026   7:23 PM           8837 INSTALL.vcxproj
+-a----          9/1/2026   7:23 PM            547 INSTALL.vcxproj.filters
+-a----          9/1/2026   7:23 PM            953 jni.slnx
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\plugins\jni\ALL_BUILD.dir
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:23 PM                Debug
+d-----          9/1/2026   7:23 PM                Profile
+d-----          9/1/2026   7:23 PM                Release
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\plugins\jni\CMakeFiles
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/2/2026   5:24 AM             55 generate.stamp
+-a----          9/2/2026   5:24 AM            166 generate.stamp.depend
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\plugins\jni\INSTALL.dir
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:23 PM                Debug
+d-----          9/1/2026   7:23 PM                Profile
+d-----          9/1/2026   7:23 PM                Release
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\plugins\jni\shared
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:23 PM                ALL_BUILD.dir
+d-----          9/2/2026   5:24 AM                CMakeFiles
+d-----          9/1/2026   7:23 PM                INSTALL.dir
+-a----          9/2/2026   5:14 AM          19405 ALL_BUILD.vcxproj
+-a----          9/1/2026   7:23 PM            344 ALL_BUILD.vcxproj.filters
+-a----          9/2/2026   5:24 AM           1405 cmake_install.cmake
+-a----          9/1/2026   7:23 PM           8865 INSTALL.vcxproj
+-a----          9/1/2026   7:23 PM            547 INSTALL.vcxproj.filters
+-a----          9/1/2026   7:23 PM            962 jni_library.slnx
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\plugins\jni\shared\ALL_BUILD.dir
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:23 PM                Debug
+d-----          9/1/2026   7:23 PM                Profile
+d-----          9/1/2026   7:23 PM                Release
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\plugins\jni\shared\CMakeFiles
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/2/2026   5:24 AM             55 generate.stamp
+-a----          9/2/2026   5:24 AM           3604 generate.stamp.depend
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\plugins\jni\shared\INSTALL.dir
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:23 PM                Debug
+d-----          9/1/2026   7:23 PM                Profile
+d-----          9/1/2026   7:23 PM                Release
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\runner
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                ALL_BUILD.dir
+d-----          9/2/2026   5:24 AM                CMakeFiles
+d-----          9/1/2026   7:24 PM                Debug
+d-----          9/1/2026   1:24 PM                erp_pos_flutter.dir
+d-----          9/1/2026   1:24 PM                INSTALL.dir
+-a----          9/1/2026   1:24 PM           9177 ALL_BUILD.vcxproj
+-a----          9/1/2026   1:24 PM            308 ALL_BUILD.vcxproj.filters
+-a----          9/2/2026   5:24 AM           1357 cmake_install.cmake
+-a----          9/1/2026   7:23 PM          26257 erp_pos_flutter.vcxproj
+-a----          9/1/2026   1:24 PM           1430 erp_pos_flutter.vcxproj.filters
+-a----          9/1/2026   1:24 PM           8817 INSTALL.vcxproj
+-a----          9/1/2026   1:24 PM            547 INSTALL.vcxproj.filters
+-a----          9/1/2026   7:23 PM           2574 runner.slnx
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\runner\ALL_BUILD.dir
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                Debug
+d-----          9/1/2026   1:24 PM                Profile
+d-----          9/1/2026   1:24 PM                Release
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\runner\CMakeFiles
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/2/2026   5:24 AM             55 generate.stamp
+-a----          9/2/2026   5:24 AM            126 generate.stamp.depend
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\runner\Debug
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:25 AM                data
+-a----          9/1/2026   7:24 PM        1347072 connectivity_plus_plugin.dll
+-a----          9/1/2026   7:24 PM        1266688 erp_pos_flutter.exe
+-a----          9/1/2026   7:24 PM        8744960 erp_pos_flutter.pdb
+-a----          8/1/2026   9:40 AM       45550592 flutter_windows.dll
+-a----          9/1/2026   7:23 PM        1709056 sqlite3.dll
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\runner\Debug\data
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:25 AM                flutter_assets
+-a----          8/1/2026   9:40 AM         862304 icudtl.dat
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\runner\Debug\data\flutter_assets
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:25 AM                fonts
+d-----          9/2/2026   5:25 AM                packages
+d-----          9/2/2026   5:25 AM                shaders
+-a----          9/2/2026   5:24 AM            117 AssetManifest.bin
+-a----          9/2/2026   5:24 AM            208 FontManifest.json
+-a----          9/2/2026   5:24 AM       55896592 kernel_blob.bin
+-a----          9/2/2026   5:14 AM            131 NativeAssetsManifest.json
+-a----          9/2/2026   5:24 AM         113900 NOTICES.Z
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\runner\Debug\data\flutter_assets\fonts
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:17 PM        1645184 MaterialIcons-Regular.otf
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\runner\Debug\data\flutter_assets\packages
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:25 AM                cupertino_icons
+
+
+    Directory:
+    D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\runner\Debug\data\flutter_assets\packages\cupertino_icons
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:25 AM                assets
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\runner\Debug\data\flutter_assets\packages\cuper
+    tino_icons\assets
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:29 PM         257628 CupertinoIcons.ttf
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\runner\Debug\data\flutter_assets\shaders
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/2/2026   5:24 AM          21856 ink_sparkle.frag
+-a----          9/2/2026   5:25 AM          17624 stretch_effect.frag
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\runner\erp_pos_flutter.dir
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:24 PM                Debug
+d-----          9/1/2026   1:24 PM                Profile
+d-----          9/1/2026   1:24 PM                Release
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\runner\erp_pos_flutter.dir\Debug
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:25 AM                erp_pos_flutter.tlog
+-a----          9/2/2026   5:25 AM            833 erp_pos_flutter.exe.recipe
+-a----          9/1/2026   7:24 PM        5645736 erp_pos_flutter.ilk
+-a----          9/1/2026   7:24 PM         400257 flutter_window.obj
+-a----          9/1/2026   7:24 PM         136558 generated_plugin_registrant.obj
+-a----          9/1/2026   7:24 PM         315895 main.obj
+-a----          9/1/2026   7:24 PM          34988 Runner.res
+-a----          9/1/2026   7:24 PM         316097 utils.obj
+-a----          9/1/2026   7:24 PM         733184 vc145.pdb
+-a----          9/1/2026   7:24 PM          98593 win32_window.obj
+
+
+    Directory:
+    D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\runner\erp_pos_flutter.dir\Debug\erp_pos_flutter.tlog
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   7:24 PM           9360 CL.command.1.tlog
+-a----          9/2/2026   5:25 AM            899 Cl.items.tlog
+-a----          9/1/2026   7:24 PM         208408 CL.read.1.tlog
+-a----          9/1/2026   7:24 PM           3750 CL.write.1.tlog
+-a----          9/1/2026   1:25 PM            593 CustomBuild.command.1.tlog
+-a----          9/1/2026   1:25 PM             71 CustomBuild.read.1.tlog
+-a----          9/1/2026   1:25 PM            162 CustomBuild.write.1.tlog
+-a----          9/2/2026   5:25 AM            308 erp_pos_flutter.lastbuildstate
+-a----          9/1/2026   7:24 PM           3636 link.command.1.tlog
+-a----          9/1/2026   7:24 PM           6894 link.read.1.tlog
+-a----          9/1/2026   7:24 PM            751 link.secondary.1.tlog
+-a----          9/1/2026   7:24 PM           1646 link.write.1.tlog
+-a----          9/1/2026   7:24 PM           1616 rc.command.1.tlog
+-a----          9/1/2026   7:24 PM           2986 rc.read.1.tlog
+-a----          9/1/2026   7:24 PM            338 rc.write.1.tlog
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\runner\INSTALL.dir
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                Debug
+d-----          9/1/2026   1:24 PM                Profile
+d-----          9/1/2026   1:24 PM                Release
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\x64
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:25 PM                Debug
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\x64\Debug
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:25 PM                ALL_BUILD
+d-----          9/1/2026   1:25 PM                INSTALL
+d-----          9/1/2026   1:24 PM                ZERO_CHECK
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\x64\Debug\ALL_BUILD
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:25 AM                ALL_BUILD.tlog
+-a----          9/2/2026   5:25 AM            981 ALL_BUILD.recipe
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\x64\Debug\ALL_BUILD\ALL_BUILD.tlog
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/2/2026   5:25 AM            301 ALL_BUILD.lastbuildstate
+-a----          9/1/2026   7:24 PM            579 CustomBuild.command.1.tlog
+-a----          9/1/2026   7:24 PM           3981 CustomBuild.read.1.tlog
+-a----          9/1/2026   7:24 PM            148 CustomBuild.write.1.tlog
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\x64\Debug\INSTALL
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:25 AM                INSTALL.tlog
+-a----          9/2/2026   5:25 AM           1127 INSTALL.recipe
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\x64\Debug\INSTALL\INSTALL.tlog
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/2/2026   5:25 AM            311 CustomBuild.command.1.tlog
+-a----          9/2/2026   5:25 AM            122 CustomBuild.read.1.tlog
+-a----          9/2/2026   5:25 AM            205 CustomBuild.write.1.tlog
+-a----          9/2/2026   5:25 AM            301 INSTALL.lastbuildstate
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\x64\Debug\ZERO_CHECK
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   5:24 AM                ZERO_CHECK.tlog
+-a----          9/2/2026   5:24 AM            320 ZERO_CHECK.recipe
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\x64\Debug\ZERO_CHECK\ZERO_CHECK.tlog
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/2/2026   5:14 AM            683 CustomBuild.command.1.tlog
+-a----          9/2/2026   5:14 AM           6825 CustomBuild.read.1.tlog
+-a----          9/2/2026   5:14 AM            699 CustomBuild.write.1.tlog
+-a----          9/2/2026   5:24 AM            301 ZERO_CHECK.lastbuildstate
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\build\windows\x64\ZERO_CHECK.dir
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                Debug
+d-----          9/1/2026   1:24 PM                Profile
+d-----          9/1/2026   1:24 PM                Release
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:09 PM                Flutter
+d-----          9/1/2026   1:09 PM                Runner
+d-----          9/1/2026   1:08 PM                Runner.xcodeproj
+d-----          9/1/2026   1:08 PM                Runner.xcworkspace
+d-----          9/1/2026   1:08 PM                RunnerTests
+-a----          7/7/2026   1:10 PM            603 .gitignore
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\Flutter
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:09 PM                ephemeral
+-a----          7/7/2026   1:10 PM            744 AppFrameworkInfo.plist
+-a----          7/7/2026   1:10 PM             31 Debug.xcconfig
+-a----          9/1/2026   1:09 PM            669 flutter_export_environment.sh
+-a----          9/1/2026   1:09 PM            630 Generated.xcconfig
+-a----          7/7/2026   1:10 PM             31 Release.xcconfig
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\Flutter\ephemeral
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026  10:11 AM                Packages
+-a----          9/1/2026   1:09 PM            108 flutter_lldbinit
+-a----          9/1/2026   1:09 PM           1276 flutter_lldb_helper.py
+-a----          9/1/2026   1:09 PM            480 flutter_native_integration.env
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\Flutter\ephemeral\Packages
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026  10:11 AM                .packages
+d-----          9/1/2026   1:09 PM                FlutterGeneratedPluginSwiftPackage
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\Flutter\ephemeral\Packages\FlutterGeneratedPluginSwiftPackage
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:09 PM                Sources
+-a----          9/2/2026  10:11 AM            596 Package.swift
+
+
+    Directory:
+    D:\erp_pos_system\apps\erp_pos_flutter\ios\Flutter\ephemeral\Packages\FlutterGeneratedPluginSwiftPackage\Sources
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:09 PM                FlutterGeneratedPluginSwiftPackage
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\Flutter\ephemeral\Packages\FlutterGeneratedPluginSwiftPackage
+    \Sources\FlutterGeneratedPluginSwiftPackage
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   1:09 PM             38 FlutterGeneratedPluginSwiftPackage.swift
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\Runner
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:08 PM                Assets.xcassets
+d-----          9/1/2026   1:08 PM                Base.lproj
+-a----          7/7/2026   1:10 PM            555 AppDelegate.swift
+-a----          9/1/2026   1:09 PM            378 GeneratedPluginRegistrant.h
+-a----          9/1/2026   1:27 PM            489 GeneratedPluginRegistrant.m
+-a----          9/1/2026   1:08 PM           2298 Info.plist
+-a----          7/7/2026   1:10 PM             39 Runner-Bridging-Header.h
+-a----          7/7/2026   1:10 PM             82 SceneDelegate.swift
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\Runner\Assets.xcassets
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:08 PM                AppIcon.appiconset
+d-----          9/1/2026   1:08 PM                LaunchImage.imageset
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\Runner\Assets.xcassets\AppIcon.appiconset
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:10 PM           2641 Contents.json
+-a----          7/7/2026  11:52 AM          10932 Icon-App-1024x1024@1x.png
+-a----          7/7/2026  11:52 AM            295 Icon-App-20x20@1x.png
+-a----          7/7/2026  11:52 AM            406 Icon-App-20x20@2x.png
+-a----          7/7/2026  11:52 AM            450 Icon-App-20x20@3x.png
+-a----          7/7/2026  11:52 AM            282 Icon-App-29x29@1x.png
+-a----          7/7/2026  11:52 AM            462 Icon-App-29x29@2x.png
+-a----          7/7/2026  11:52 AM            704 Icon-App-29x29@3x.png
+-a----          7/7/2026  11:52 AM            406 Icon-App-40x40@1x.png
+-a----          7/7/2026  11:52 AM            586 Icon-App-40x40@2x.png
+-a----          7/7/2026  11:52 AM            862 Icon-App-40x40@3x.png
+-a----          7/7/2026  11:52 AM            862 Icon-App-60x60@2x.png
+-a----          7/7/2026  11:52 AM           1674 Icon-App-60x60@3x.png
+-a----          7/7/2026  11:52 AM            762 Icon-App-76x76@1x.png
+-a----          7/7/2026  11:52 AM           1226 Icon-App-76x76@2x.png
+-a----          7/7/2026  11:52 AM           1418 Icon-App-83.5x83.5@2x.png
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\Runner\Assets.xcassets\LaunchImage.imageset
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:10 PM            414 Contents.json
+-a----          7/7/2026  11:52 AM             68 LaunchImage.png
+-a----          7/7/2026  11:52 AM             68 LaunchImage@2x.png
+-a----          7/7/2026  11:52 AM             68 LaunchImage@3x.png
+-a----          7/7/2026   1:10 PM            340 README.md
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\Runner\Base.lproj
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:10 PM           2414 LaunchScreen.storyboard
+-a----          7/7/2026   1:10 PM           1631 Main.storyboard
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\Runner.xcodeproj
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:08 PM                project.xcworkspace
+d-----          9/1/2026   1:08 PM                xcshareddata
+-a----          9/1/2026   1:08 PM          26306 project.pbxproj
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\Runner.xcodeproj\project.xcworkspace
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:08 PM                xcshareddata
+-a----          7/7/2026   1:10 PM            142 contents.xcworkspacedata
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\Runner.xcodeproj\project.xcworkspace\xcshareddata
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:10 PM            246 IDEWorkspaceChecks.plist
+-a----          7/7/2026   1:10 PM            234 WorkspaceSettings.xcsettings
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\Runner.xcodeproj\xcshareddata
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:08 PM                xcschemes
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\Runner.xcodeproj\xcshareddata\xcschemes
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   1:08 PM           4836 Runner.xcscheme
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\Runner.xcworkspace
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:08 PM                xcshareddata
+-a----          7/7/2026   1:10 PM            159 contents.xcworkspacedata
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\Runner.xcworkspace\xcshareddata
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026   1:10 PM            246 IDEWorkspaceChecks.plist
+-a----          7/7/2026   1:10 PM            234 WorkspaceSettings.xcsettings
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\ios\RunnerTests
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   1:08 PM            297 RunnerTests.swift
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\lib
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   2:02 PM                app
+d-----          9/1/2026   2:02 PM                core
+d-----          9/1/2026   2:02 PM                data
+d-----          9/1/2026   2:02 PM                features
+-a----          9/1/2026   7:22 PM           5174 main.dart
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\lib\data
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   7:21 PM                database
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\lib\data\database
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   2:16 PM                tables
+-a----          9/1/2026   7:13 PM           2837 app_database.dart
+-a----          9/1/2026   2:18 PM          33713 app_database.g.dart
+-a----          9/2/2026   5:23 AM           1279 test_database.dart
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\lib\data\database\tables
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   2:19 PM           2845 products.dart
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\test
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/1/2026   1:08 PM           1096 widget_test.dart
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\windows
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                flutter
+d-----          9/1/2026   1:08 PM                runner
+-a----          7/7/2026   1:10 PM            308 .gitignore
+-a----          9/1/2026   1:08 PM           4274 CMakeLists.txt
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\windows\flutter
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:27 PM                ephemeral
+-a----          7/7/2026   1:10 PM           3851 CMakeLists.txt
+-a----          9/1/2026   1:27 PM            769 generated_plugins.cmake
+-a----          9/1/2026   1:27 PM            355 generated_plugin_registrant.cc
+-a----          9/1/2026   1:09 PM            302 generated_plugin_registrant.h
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\windows\flutter\ephemeral
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:27 PM                .plugin_symlinks
+d-----          9/1/2026   1:24 PM                cpp_client_wrapper
+-a----          8/1/2026   9:40 AM            838 flutter_export.h
+-a----          8/1/2026   9:40 AM           5204 flutter_messenger.h
+-a----          8/1/2026   9:40 AM           1638 flutter_plugin_registrar.h
+-a----          8/1/2026   9:40 AM           7332 flutter_texture_registrar.h
+-a----          8/1/2026   9:40 AM       45550592 flutter_windows.dll
+-a----          8/1/2026   9:40 AM          21650 flutter_windows.dll.exp
+-a----          8/1/2026   9:40 AM          37212 flutter_windows.dll.lib
+-a----          8/1/2026   9:41 AM      276688896 flutter_windows.dll.pdb
+-a----          8/1/2026   9:40 AM          15192 flutter_windows.h
+-a----          9/2/2026   5:24 AM           1296 generated_config.cmake
+-a----          8/1/2026   9:40 AM         862304 icudtl.dat
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\windows\flutter\ephemeral\.plugin_symlinks
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d----l          9/1/2026   1:27 PM                connectivity_plus
+d----l          9/1/2026   1:27 PM                jni
+d----l          9/1/2026   1:27 PM                path_provider_windows
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\windows\flutter\ephemeral\cpp_client_wrapper
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                include
+-a----          8/1/2026   9:41 AM           1651 binary_messenger_impl.h
+-a----          8/1/2026   9:41 AM           2946 byte_buffer_streams.h
+-a----          8/1/2026   9:41 AM          10712 core_implementations.cc
+-a----          8/1/2026   9:41 AM            529 engine_method_result.cc
+-a----          8/1/2026   9:41 AM           4169 flutter_engine.cc
+-a----          8/1/2026   9:41 AM           1726 flutter_view_controller.cc
+-a----          8/1/2026   9:41 AM           1783 plugin_registrar.cc
+-a----          8/1/2026   9:41 AM            496 readme
+-a----          8/1/2026   9:41 AM          15447 standard_codec.cc
+-a----          8/1/2026   9:41 AM           1543 texture_registrar_impl.h
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\windows\flutter\ephemeral\cpp_client_wrapper\include
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:24 PM                flutter
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\windows\flutter\ephemeral\cpp_client_wrapper\include\flutter
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          8/1/2026   9:41 AM           5866 basic_message_channel.h
+-a----          8/1/2026   9:41 AM           1947 binary_messenger.h
+-a----          8/1/2026   9:41 AM           2908 byte_streams.h
+-a----          8/1/2026   9:41 AM           6568 dart_project.h
+-a----          8/1/2026   9:41 AM          11663 encodable_value.h
+-a----          8/1/2026   9:41 AM           2933 engine_method_result.h
+-a----          8/1/2026   9:41 AM           7606 event_channel.h
+-a----          8/1/2026   9:41 AM           2167 event_sink.h
+-a----          8/1/2026   9:41 AM           2954 event_stream_handler.h
+-a----          8/1/2026   9:41 AM           2654 event_stream_handler_functions.h
+-a----          8/1/2026   9:41 AM           5486 flutter_engine.h
+-a----          8/1/2026   9:41 AM           1459 flutter_view.h
+-a----          8/1/2026   9:41 AM           2719 flutter_view_controller.h
+-a----          8/1/2026   9:41 AM           2305 message_codec.h
+-a----          8/1/2026   9:41 AM           1402 method_call.h
+-a----          8/1/2026   9:41 AM           5949 method_channel.h
+-a----          8/1/2026   9:41 AM           4381 method_codec.h
+-a----          8/1/2026   9:41 AM           2860 method_result.h
+-a----          8/1/2026   9:41 AM           2800 method_result_functions.h
+-a----          8/1/2026   9:41 AM           4812 plugin_registrar.h
+-a----          8/1/2026   9:41 AM           5957 plugin_registrar_windows.h
+-a----          8/1/2026   9:41 AM           1225 plugin_registry.h
+-a----          8/1/2026   9:41 AM           2957 standard_codec_serializer.h
+-a----          8/1/2026   9:41 AM           2108 standard_message_codec.h
+-a----          8/1/2026   9:41 AM           2688 standard_method_codec.h
+-a----          8/1/2026   9:41 AM           4341 texture_registrar.h
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\windows\runner
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/1/2026   1:08 PM                resources
+-a----          7/7/2026   1:10 PM           1836 CMakeLists.txt
+-a----          7/7/2026   1:10 PM           2193 flutter_window.cpp
+-a----          7/7/2026   1:10 PM            961 flutter_window.h
+-a----          9/1/2026   1:08 PM           1311 main.cpp
+-a----          7/7/2026   1:10 PM            448 resource.h
+-a----          7/7/2026   1:10 PM            616 runner.exe.manifest
+-a----          9/1/2026   1:08 PM           3186 Runner.rc
+-a----          7/7/2026   1:10 PM           2237 utils.cpp
+-a----          7/7/2026   1:10 PM            691 utils.h
+-a----          7/7/2026   1:10 PM           8822 win32_window.cpp
+-a----          7/7/2026   1:10 PM           3624 win32_window.h
+
+
+    Directory: D:\erp_pos_system\apps\erp_pos_flutter\windows\runner\resources
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          7/7/2026  11:52 AM          33772 app_icon.ico
+
+
+    Directory: D:\erp_pos_system\services
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----          9/2/2026   9:57 AM                erp_pos_api
+
+
+    Directory: D:\erp_pos_system\services\erp_pos_api
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/2/2026   9:54 AM            790 .env
+-a----          9/2/2026   9:56 AM            588 .env.example
+-a----          9/2/2026   9:57 AM            599 .gitignore
+
+
+    Directory: D:\erp_pos_system\โปรแกรม
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----          9/2/2026   8:15 AM       92852224 ฐานข้อมูลmariadb-12.3.3-winx64.msi
+
+
+PS D:\erp_pos_system>
+
+โปรดอธิบายภาพรวม ให้เข้าใจตรงกันก่อนเริ่มเขียนโค้ด
