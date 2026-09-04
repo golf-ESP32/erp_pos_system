@@ -1,2 +1,36 @@
-*.msi
-*.exe
+# Environmental variables / Secrets
+*.env
+*.env.*
+!.env.example
+config.secrets.json
+
+# Text & Temporary test files
+a.txt
+พร้อมAI/
+
+# Databases & Backups
+*.db
+*.sqlite
+*.mdf
+*.ldf
+*.sql
+
+# Flutter / Dart Build outputs & local tools
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+build/
+*.iml
+.idea/
+.vscode/
+
+# Node.js / Service builds
+node_modules/
+dist/
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
